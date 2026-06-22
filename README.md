@@ -1,6 +1,6 @@
 # Ebonhold Client Mod
 
-Client-side mod for the **Ebonhold** 3.3.5a (WotLK) WoW private server.
+Client-side mod for the **Ebonhold**
 
 A native DLL injected into `Wow.exe` via import-table patching — it auto-loads with the
 client, no launcher hook required. It registers custom Lua C-functions into the GlueXML
