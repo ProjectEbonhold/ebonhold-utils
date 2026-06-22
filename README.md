@@ -103,21 +103,6 @@ The DLL reads patches from `<WoW>\Data\` and writes diagnostics to `ebonhold.log
 
 ---
 
-## Code signing (optional)
-
-The binaries can be Authenticode-signed with the project's code-signing certificate. If the
-cert is installed in the Windows store, sign by thumbprint (no password needed):
-
-```powershell
-$st = "C:\Program Files (x86)\Windows Kits\10\bin\<sdk>\x64\signtool.exe"
-& $st sign /sha1 <THUMBPRINT> /fd sha256 /tr http://timestamp.digicert.com/ /td sha256 ebonhold.dll ebonhold_applymod.exe
-```
-
-> A self-signed certificate proves integrity but will **not** clear SmartScreen / AV
-> detections. A CA-issued (OV/EV) code-signing certificate is required for that.
-
----
-
 ## Notes
 
 - 32-bit x86 only — addresses in `offsets.h` are specific to one `Wow.exe` build and will not
