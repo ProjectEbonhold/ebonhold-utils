@@ -108,7 +108,10 @@ int main(int argc, char** argv) {
     *(DWORD*)(nh + 12) = newVA;
     *(DWORD*)(nh + 16) = rawBlob;
     *(DWORD*)(nh + 20) = newOff;
-    *(DWORD*)(nh + 36) = 0xC0000040;   // INITIALIZED_DATA | READ | WRITE
+    *(DWORD*)(nh + 36) = 0x40000040;   // INITIALIZED_DATA | READ (no WRITE — holds
+                                       // only import data, like a normal .rdata; a
+                                       // writable+executable-reachable section is a
+                                       // heuristic red flag and isn't needed here)
 
     *(WORD*)(b + e + 6) = numSec + 1;
     *(DWORD*)(opt + 0x38) = AlignUp(newVA + (DWORD)blob.size(), sectAlign);  // SizeOfImage

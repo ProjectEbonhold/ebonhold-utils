@@ -23,12 +23,29 @@
 #include <mutex>
 #include "offsets.h"
 #include "glue_script.h"   // kGlueScript[] — embedded ebonhold_glue.lua (auto-generated)
+#include "extbank/client/extbank_client.h"  // ExtBank client half (header-only)
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "shell32.lib")
 
 // ---------------------------------------------------------------- logging ----
+// Log under %LOCALAPPDATA%\ebonhold\ebonhold.log (no hardcoded user path —
+// hardcoded C:\Users\... paths are a malware-heuristic red flag and don't work
+// on anyone else's machine). Path is resolved once and cached.
+static const char* LogPath() {
+    static char path[MAX_PATH] = { 0 };
+    if (path[0]) return path;
+    char base[MAX_PATH];
+    DWORD n = GetEnvironmentVariableA("LOCALAPPDATA", base, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return nullptr;
+    char dir[MAX_PATH];
+    _snprintf(dir, sizeof(dir), "%s\\ebonhold", base);
+    CreateDirectoryA(dir, NULL);
+    _snprintf(path, sizeof(path), "%s\\ebonhold.log", dir);
+    return path;
+}
+
 static void Log(const char* fmt, ...) {
     char buf[1200];
     va_list ap; va_start(ap, fmt);
@@ -37,11 +54,23 @@ static void Log(const char* fmt, ...) {
     if (n < 0) n = (int)strlen(buf);
     buf[n] = '\n'; buf[n + 1] = 0;
     OutputDebugStringA(buf);
-    HANDLE h = CreateFileA("C:\\Users\\noemo\\AppData\\Local\\ebonhold\\ebonhold.log",
-                           FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+    const char* lp = LogPath();
+    if (!lp) return;
+    HANDLE h = CreateFileA(lp, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
                            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h != INVALID_HANDLE_VALUE) { DWORD w; SetFilePointer(h, 0, NULL, FILE_END);
         WriteFile(h, buf, (DWORD)(n + 1), &w, NULL); CloseHandle(h); }
+}
+
+// Bridge so extbank_client.h can log into ebonhold.log without seeing Log()'s
+// internal linkage. Declared in extbank_client.h.
+namespace ExtBankClient {
+    void EBLog(const char* fmt, ...) {
+        char buf[1024]; va_list ap; va_start(ap, fmt);
+        _vsnprintf(buf, sizeof(buf) - 1, fmt, ap); va_end(ap);
+        buf[sizeof(buf) - 1] = 0;
+        Log("%s", buf);
+    }
 }
 
 // --------------------------------------------------------------- Lua glue ----
@@ -215,6 +244,97 @@ static int __cdecl Lua_GetPatchCheckResult(void* L) {   // nil while running
     return 1;
 }
 
+// ============================================================================
+//  LOGIN MESSAGE (MOTD)
+//    FetchLoginMessage(url)      -> async GET; expects {date:..., message:"..."}
+//    GetLoginMessageResult()     -> nil while running, else
+//                                   status ("OK"|"NONE"|"ERROR:..."), date, message
+//  Empty body / {} / missing "message" field => "NONE" (nothing to show).
+// ============================================================================
+static std::mutex  g_lmMutex;
+static std::string g_lmStatus, g_lmDate, g_lmMessage;
+static bool        g_lmDone = false;
+static bool        g_lmRunning = false;
+
+// Extract the value of `key` from a small flat JSON object. Handles quoted
+// strings (with \n \t \" \\ \/ escapes; \uXXXX degrades to '?') and bare
+// values (numbers, unquoted dates). Returns false if the key is absent.
+static bool JsonField(const std::string& json, const char* key, std::string& out) {
+    std::string nk = "\""; nk += key; nk += "\"";
+    size_t pos = json.find(nk);
+    if (pos == std::string::npos) return false;
+    size_t colon = json.find(':', pos + nk.size());
+    if (colon == std::string::npos) return false;
+    size_t i = colon + 1;
+    while (i < json.size() && isspace((unsigned char)json[i])) ++i;
+    if (i >= json.size()) return false;
+    out.clear();
+    if (json[i] == '"') {
+        for (++i; i < json.size() && json[i] != '"'; ++i) {
+            char c = json[i];
+            if (c == '\\' && i + 1 < json.size()) {
+                char e = json[++i];
+                switch (e) {
+                    case 'n': out += '\n'; break;
+                    case 't': out += '\t'; break;
+                    case 'r': break;
+                    case 'u': i += 4; out += '?'; break;
+                    default:  out += e; break;   // \" \\ \/ ...
+                }
+            } else out += c;
+        }
+    } else {
+        while (i < json.size() && json[i] != ',' && json[i] != '}') out += json[i++];
+        while (!out.empty() && isspace((unsigned char)out.back())) out.pop_back();
+    }
+    return true;
+}
+
+struct LmArgs { std::string url; };
+
+static DWORD WINAPI LoginMsgThread(LPVOID param) {
+    LmArgs* a = (LmArgs*)param;
+    std::string status = "NONE", date, msg, body;
+    if (!HttpGet(a->url, body)) {
+        status = "ERROR:http request failed";
+    } else {
+        Log("[motd] api response (%u bytes): %.300s", (unsigned)body.size(), body.c_str());
+        if (JsonField(body, "message", msg) && !msg.empty()) {
+            JsonField(body, "date", date);
+            status = "OK";
+        }
+    }
+    Log("[motd] result = %s", status.c_str());
+    { std::lock_guard<std::mutex> lk(g_lmMutex);
+      g_lmStatus = status; g_lmDate = date; g_lmMessage = msg;
+      g_lmDone = true; g_lmRunning = false; }
+    delete a;
+    return 0;
+}
+
+static int __cdecl Lua_FetchLoginMessage(void* L) {     // FetchLoginMessage(url)
+    if (!Lua_IsString(L, 1))
+        return Lua_Error(L, "Usage: FetchLoginMessage(url)");
+    { std::lock_guard<std::mutex> lk(g_lmMutex);
+      if (g_lmRunning) return 0;
+      g_lmRunning = true; g_lmDone = false; }
+    LmArgs* a = new LmArgs();
+    a->url = Lua_ToString(L, 1);
+    CreateThread(nullptr, 0, LoginMsgThread, a, 0, nullptr);
+    return 0;
+}
+
+static int __cdecl Lua_GetLoginMessageResult(void* L) {  // nil while running
+    std::string s, d, m; bool done;
+    { std::lock_guard<std::mutex> lk(g_lmMutex);
+      done = g_lmDone; s = g_lmStatus; d = g_lmDate; m = g_lmMessage; }
+    if (!done) return 0;
+    Lua_PushString(L, s.c_str());
+    Lua_PushString(L, d.c_str());
+    Lua_PushString(L, m.c_str());
+    return 3;
+}
+
 // ---------------------------------------------- run Lua in the glue state ----
 static void ExecGlue(const char* code, const char* src) {
     ((void(__cdecl*)(const char*, const char*, int))Off::FrameScript_Execute)(code, src, 0);
@@ -265,6 +385,15 @@ static CustomFn g_customFns[] = {
     { "GetPatchCheckResult",  Lua_GetPatchCheckResult  },
     { "EbonholdLog",          Lua_EbonholdLog          },
     { "EbonholdOpenURL",      Lua_OpenURL              },
+    { "FetchLoginMessage",     Lua_FetchLoginMessage    },
+    { "GetLoginMessageResult", Lua_GetLoginMessageResult},
+    // ExtBank client API. These are registered into BOTH the glue state (via the
+    // glue detour) and the IN-GAME state (via InstallExecuteDetour, which
+    // re-registers all custom fns whenever the active lua_State changes).
+    { "ExtBankOpen",          ExtBankClient::Lua_ExtBankOpen      },
+    { "ExtBankMove",          ExtBankClient::Lua_ExtBankMove      },
+    { "ExtBankUnlock",        ExtBankClient::Lua_ExtBankUnlock    },
+    { "ExtBankSetActive",     ExtBankClient::Lua_ExtBankSetActive },
     // add more custom Glue Lua functions here
 };
 static void RegisterAllCustomFns() {
@@ -287,11 +416,71 @@ static void __cdecl Detour_GlueRegister() {
 }
 static bool InstallGlueDetour() {
     BYTE* t = (BYTE*)Off::GlueRegisterLoop; DWORD op;
-    VirtualProtect(t, 5, PAGE_EXECUTE_READWRITE, &op);
+    // W^X: write with PAGE_READWRITE (writable, NOT executable), then restore the
+    // original protection (PAGE_EXECUTE_READ). The page is never simultaneously
+    // writable+executable, so the PAGE_EXECUTE_READWRITE (RWX) constant — a top
+    // static heuristic flag — never appears in the binary. Safe here because Init
+    // runs before the game ever executes this code path.
+    VirtualProtect(t, 5, PAGE_READWRITE, &op);
     t[0] = 0xE9; *(int32_t*)(t + 1) = (int32_t)((BYTE*)&Detour_GlueRegister - (t + 5));
     VirtualProtect(t, 5, op, &op);
     FlushInstructionCache(GetCurrentProcess(), t, 5);
     Log("[hook] glue detour installed at 0x%p", (void*)t);
+    return true;
+}
+
+// ---- in-game custom-fn registration -----------------------------------------
+// FrameScript_RegisterFunction registers into the ACTIVE FrameScript lua_State
+// (*(void**)0x00D3F78C), which the client DESTROYS and RE-CREATES when switching
+// between the glue (login) and in-game states. The glue detour above only
+// populates the glue state, so custom fns are absent in-game (ExtBank* == nil).
+//
+// Fix: prefix-detour FrameScript_Execute (0x00819210) — it runs in whatever state
+// is active — and, whenever the active-state pointer changes, re-register all
+// custom fns into the new state. This transparently covers the in-game state.
+// Stolen prologue (11 bytes, through the tick-counter add):
+//   55 8B EC 51 83 05 A0 13 D4 00 01  -> resume at 0x0081921B.
+static void*      g_lastLuaState  = nullptr;
+static void*      g_execResumePtr = (void*)0x0081921B;         // FrameScript_Execute + 11
+static uint32_t** const kpFSTick  = (uint32_t**)0x00D413A0;    // tick counter (replicated add)
+static void** const kpActiveState = (void**)0x00D3F78C;        // active lua_State*
+
+static void __cdecl RegisterCustomFnsIntoActiveState() { RegisterAllCustomFns(); }
+
+static __declspec(naked) void Detour_FSExecute() {
+    __asm {
+        pushad
+        pushfd
+        // replicate the clobbered `add [0x00D413A0], 1` (protected; eax restored by popad)
+        mov  eax, kpFSTick
+        add  dword ptr [eax], 1
+        // if the active lua_State changed, (re)register our custom fns into it
+        mov  ecx, kpActiveState
+        mov  eax, [ecx]
+        test eax, eax
+        jz   skip_reg
+        cmp  eax, g_lastLuaState
+        je   skip_reg
+        mov  g_lastLuaState, eax
+        call RegisterCustomFnsIntoActiveState
+    skip_reg:
+        popfd
+        popad
+        // stolen prologue of FrameScript_Execute (push ebp; mov ebp,esp; push ecx)
+        push ebp
+        mov  ebp, esp
+        push ecx
+        jmp  dword ptr [g_execResumePtr]      // -> 0x0081921B (after the replicated add)
+    }
+}
+static bool InstallExecuteDetour() {
+    BYTE* t = (BYTE*)Off::FrameScript_Execute; DWORD op;   // 0x00819210
+    VirtualProtect(t, 11, PAGE_READWRITE, &op);
+    t[0] = 0xE9; *(int32_t*)(t + 1) = (int32_t)((BYTE*)&Detour_FSExecute - (t + 5));
+    for (int i = 5; i < 11; ++i) t[i] = 0x90;             // pad the tail of the stolen region
+    VirtualProtect(t, 11, op, &op);
+    FlushInstructionCache(GetCurrentProcess(), t, 11);
+    Log("[hook] FrameScript_Execute detour installed at 0x%p (in-game custom-fn registration)", (void*)t);
     return true;
 }
 
@@ -301,6 +490,8 @@ static DWORD WINAPI Init(LPVOID) {
     Log("[init] ebonhold.dll loaded (framework + patch check + embedded glue)");
     LoadGlueScript();      // loose override, else embedded
     InstallGlueDetour();   // registers custom fns + runs the glue script in the glue state
+    InstallExecuteDetour();// re-registers custom fns into the IN-GAME lua_State (ExtBank* callable in world)
+    ExtBankClient::InstallRecvDetour();  // registers SMSG_EXTBANK_UPDATE handler once in world
     return 0;
 }
 BOOL APIENTRY DllMain(HMODULE h, DWORD reason, LPVOID) {

@@ -17,6 +17,11 @@ local API_URL       = "https://api.project-ebonhold.com/api/launcher/file-hashes
 local POLL_INTERVAL = 0.2
 local FAIL_CLOSED   = false    -- true = block login if the API can't be reached / errors
 
+-- Login-screen message (MOTD). Empty URL = feature disabled.
+local MOTD_URL      = "https://api.project-ebonhold.com/api/launcher/login-message"
+local MOTD_INTERVAL = 60       -- seconds between endpoint queries
+local MOTD_POLL     = 0.2      -- polling of the async HTTP result
+
 local function log(m) if EbonholdLog then EbonholdLog(m) end end
 log("ebonhold_glue.lua: running")
 
@@ -150,6 +155,101 @@ local function InstallGate()
     end
 end
 
+-- ------------------------------------------------ login-screen message ------
+-- Queries MOTD_URL every MOTD_INTERVAL seconds while the LOGIN screen
+-- (AccountLogin) is up. If the endpoint returns {date=..., message="..."},
+-- shows the message in a banner above the login form, with a close (X) button.
+--   * while the banner is shown, the endpoint is NOT queried
+--   * closing it resumes polling, but the same message (same date) is ignored;
+--     it reappears only when the endpoint serves a different date
+--   * dismissal is per-session: a restart shows the message again
+local function InstallMotd()
+    if MOTD_URL == "" then return end
+    if not FetchLoginMessage or not GetLoginMessageResult then
+        log("motd: DLL functions missing, skipping")
+        return
+    end
+    if not AccountLogin then
+        log("motd: AccountLogin frame missing, skipping")
+        return
+    end
+    log("motd: installed")
+
+    -- Parented to AccountLogin so it can only ever appear on the login page
+    -- and auto-hides when the client moves to realm/character select.
+    local banner = CreateFrame("Frame", "EbonholdMotdFrame", AccountLogin)
+    banner:SetWidth(450)
+    banner:SetBackdrop({
+        bgFile   = "Interface\\DialogFrame\\UI-DialogBox-Background",
+        edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+        tile = true, tileSize = 32, edgeSize = 32,
+        insets = { left = 11, right = 11, top = 11, bottom = 11 },
+    })
+    if AccountLoginAccountEdit then
+        banner:SetPoint("BOTTOM", AccountLoginAccountEdit, "TOP", 0, 70)
+    else
+        banner:SetPoint("TOP", AccountLogin, "TOP", 0, -120)
+    end
+    banner:Hide()
+
+    local text = banner:CreateFontString(nil, "ARTWORK", "GlueFontHighlight")
+    text:SetPoint("TOPLEFT",  banner, "TOPLEFT",  20, -20)
+    text:SetPoint("TOPRIGHT", banner, "TOPRIGHT", -20, -20)
+    text:SetJustifyH("CENTER")
+
+    local close = CreateFrame("Button", nil, banner)
+    close:SetWidth(32); close:SetHeight(32)
+    close:SetPoint("TOPRIGHT", banner, "TOPRIGHT", -6, -6)
+    close:SetNormalTexture("Interface\\Buttons\\UI-Panel-MinimizeButton-Up")
+    close:SetPushedTexture("Interface\\Buttons\\UI-Panel-MinimizeButton-Down")
+    close:SetHighlightTexture("Interface\\Buttons\\UI-Panel-MinimizeButton-Highlight")
+
+    local shownDate, lastClosedDate = nil, nil
+
+    local function ShowMessage(date, msg)
+        shownDate = date
+        text:SetText(msg)
+        banner:SetHeight(text:GetHeight() + 44)
+        banner:Show()
+        log("motd: showing message (date="..tostring(date)..")")
+    end
+
+    close:SetScript("OnClick", function()
+        lastClosedDate = shownDate
+        banner:Hide()
+        log("motd: closed by user (date="..tostring(shownDate)..")")
+    end)
+
+    -- First query fires immediately (sinceFetch starts at the interval).
+    local fetching, sinceFetch, sincePoll = false, MOTD_INTERVAL, 0
+    local ticker = CreateFrame("Frame")
+    ticker:SetScript("OnUpdate", function(self, dt)
+        dt = dt or 0
+        if not AccountLogin:IsShown() then return end  -- login page only
+        if banner:IsShown() then return end            -- no query while displayed
+        if fetching then
+            sincePoll = sincePoll + dt
+            if sincePoll < MOTD_POLL then return end
+            sincePoll = 0
+            local status, date, msg = GetLoginMessageResult()
+            if not status then return end
+            fetching = false
+            sinceFetch = 0
+            if status == "OK" and msg ~= "" and date ~= lastClosedDate then
+                ShowMessage(date, msg)
+            elseif status ~= "OK" and status ~= "NONE" then
+                log("motd: "..status)
+            end
+        else
+            sinceFetch = sinceFetch + dt
+            if sinceFetch < MOTD_INTERVAL then return end
+            fetching = true
+            sincePoll = 0
+            FetchLoginMessage(MOTD_URL)
+        end
+    end)
+end
+
 -- --------------------------------------------- defer until glue UI loaded ---
 -- We run before the char-select GlueXML is loaded, so wait for its symbols.
 if not CreateFrame then
@@ -161,6 +261,7 @@ boot:SetScript("OnUpdate", function(self)
     if type(CharacterSelect_EnterWorld) == "function" and hooksecurefunc then
         self:SetScript("OnUpdate", nil)
         InstallGate()
+        InstallMotd()
     end
 end)
 log("ebonhold_glue.lua: boot frame armed")
