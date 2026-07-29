@@ -26,6 +26,8 @@ namespace Off
     constexpr uintptr_t lua_isstring                 = 0x0084DF60; // int (L,idx)
     constexpr uintptr_t lua_isnumber                 = 0x0084DF20; // int (L,idx)
     constexpr uintptr_t lua_tonumber                 = 0x0084E030; // double (L,idx)
+    constexpr uintptr_t lua_pushnil                  = 0x0084E280; // void (L)
+    constexpr uintptr_t lua_pushnumber               = 0x0084E2A0; // void (L,double)
     constexpr uintptr_t lua_pushstring               = 0x0084E350; // void (L,const char*)
     constexpr uintptr_t lua_pushcclosure             = 0x0084E400; // void (L,fn,nups)
     constexpr uintptr_t luaL_error                   = 0x0084F280; // int (L,fmt,...)

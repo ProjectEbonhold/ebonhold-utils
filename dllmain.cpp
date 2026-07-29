@@ -23,7 +23,9 @@
 #include <mutex>
 #include "offsets.h"
 #include "glue_script.h"   // kGlueScript[] — embedded ebonhold_glue.lua (auto-generated)
-#include "extbank/client/extbank_client.h"  // ExtBank client half (header-only)
+#include "extbank_client.h"  // ExtBank client half (header-only)
+#include "worldnav_client.h" // world->screen + player position (quest tracker pin)
+#include "questpoi_client.h" // forced CMSG_QUEST_POI_QUERY (quest tracker pin freshness)
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "advapi32.lib")
@@ -394,6 +396,13 @@ static CustomFn g_customFns[] = {
     { "ExtBankMove",          ExtBankClient::Lua_ExtBankMove      },
     { "ExtBankUnlock",        ExtBankClient::Lua_ExtBankUnlock    },
     { "ExtBankSetActive",     ExtBankClient::Lua_ExtBankSetActive },
+    // Quest-tracker world navigation (in-world POI pin projection). Registered
+    // into the in-game state the same way as ExtBank (Execute detour).
+    { "EbonholdWorldToScreen",     WorldNav::Lua_WorldToScreen      },
+    { "EbonholdGetPlayerPosition", WorldNav::Lua_GetPlayerPosition  },
+    // Forced quest POI query (the client only sends it C-side on map open;
+    // the tracker needs fresh accept/turn-in POIs without opening the map).
+    { "EbonholdRequestQuestPOI",   QuestPOIClient::Lua_RequestQuestPOI },
     // add more custom Glue Lua functions here
 };
 static void RegisterAllCustomFns() {
@@ -445,7 +454,72 @@ static void*      g_execResumePtr = (void*)0x0081921B;         // FrameScript_Ex
 static uint32_t** const kpFSTick  = (uint32_t**)0x00D413A0;    // tick counter (replicated add)
 static void** const kpActiveState = (void**)0x00D3F78C;        // active lua_State*
 
-static void __cdecl RegisterCustomFnsIntoActiveState() { RegisterAllCustomFns(); }
+// ---- companion ClientExt.dll: load LATE, after the client is initialized -----
+// ClientExt.dll is an anti-cheat/extension module. Its DllMain immediately spawns
+// a watchdog thread that calls a game routine (Wow.exe+0x767440), which
+// dereferences a global singleton at 0x00CA19FC. That singleton is only
+// constructed once the client has brought up its core subsystems, so loading
+// ClientExt.dll at process start (a static import) runs the watchdog too early
+// and faults in game code (0xC0000005 at Wow.exe+0x15F4F9). Instead ebonhold.dll
+// LoadLibrary()s it the first time the client runs Lua (the glue/login state is
+// live by then, so the singleton exists). Loading it here also guarantees
+// ebonhold.dll is fully initialized before ClientExt. LoadLibrary-by-name needs
+// no export, so ClientExt.dll is no longer in the exe's static import table.
+// ClientExt.dll is a realmlist-lock. A watchdog thread reads the realmList CVar
+// and, if the value is not one of its whitelisted hosts
+// (logon.project-ebonhold.com[:3724]), runs a self-destruct routine at RVA 0x114E0
+// that Sleeps a random 1.5-5.5s and then writes 0xDEADBEEF to address 0 -> an
+// 0xC0000005 that terminates the client. On a local/dev realm (e.g. 127.0.0.1)
+// that kills the process a few seconds after login. RVA of the self-destruct
+// routine's first instruction:
+static const uintptr_t kClientExtSelfDestructRVA = 0x114E0;
+
+// Neutralize the realmlist self-destruct so a non-whitelisted (local) realmList
+// doesn't crash the client: overwrite the routine's first byte with 0xC3 (ret) so
+// it returns immediately; the watchdog then just loops harmlessly. On the official
+// realm the check matches and this routine is never called, so this is a no-op
+// there -- it only has any effect on a non-whitelisted realmList. Idempotent.
+// W^X: flip to PAGE_READWRITE (writable, not executable) for the single-byte write,
+// then restore the original PAGE_EXECUTE_READ (never RWX).
+static void NeutralizeClientExt(HMODULE h) {
+    if (!h) return;
+    static LONG patched = 0;
+    if (InterlockedExchange(&patched, 1)) return;      // one-shot across all callers
+    BYTE* sd = (BYTE*)h + kClientExtSelfDestructRVA;
+    DWORD op = 0;
+    if (VirtualProtect(sd, 1, PAGE_READWRITE, &op)) {
+        BYTE prev = sd[0];
+        sd[0] = 0xC3;                                  // ret
+        VirtualProtect(sd, 1, op, &op);
+        FlushInstructionCache(GetCurrentProcess(), sd, 1);
+        Log("[clientext] neutralized realmlist self-destruct at %p (0x%02X -> 0xC3)", (void*)sd, prev);
+    } else {
+        InterlockedExchange(&patched, 0);              // let a later caller retry
+        Log("[clientext] WARN: could not unprotect self-destruct at %p (err=%lu)", (void*)sd, GetLastError());
+    }
+}
+
+static void LoadClientExtOnce() {
+    static LONG loaded = 0;
+    if (InterlockedExchange(&loaded, 1)) return;      // one-shot
+    // If the exe statically imported ClientExt.dll it is already mapped; otherwise
+    // load it now (ebonhold-only exe). Either way, neutralize the self-destruct.
+    HMODULE h = GetModuleHandleA("ClientExt.dll");
+    if (h) {
+        Log("[clientext] already mapped (static import) hMod=%p", (void*)h);
+    } else {
+        std::string path = GetExeDir() + "ClientExt.dll";
+        h = LoadLibraryA(path.c_str());
+        if (!h) { Log("[clientext] LoadLibrary(%s) failed err=%lu", path.c_str(), GetLastError()); return; }
+        Log("[clientext] loaded %s (hMod=%p)", path.c_str(), (void*)h);
+    }
+    NeutralizeClientExt(h);
+}
+
+static void __cdecl RegisterCustomFnsIntoActiveState() {
+    RegisterAllCustomFns();
+    LoadClientExtOnce();   // client is up (Lua running) -> safe to bring up ClientExt
+}
 
 static __declspec(naked) void Detour_FSExecute() {
     __asm {
@@ -488,6 +562,13 @@ static bool InstallExecuteDetour() {
 static DWORD WINAPI Init(LPVOID) {
     Log("=========================================================");
     Log("[init] ebonhold.dll loaded (framework + patch check + embedded glue)");
+    // If ClientExt.dll was statically imported it is already running its watchdog;
+    // patch its self-destruct as early as we can (also retried at first Lua via
+    // LoadClientExtOnce, which covers the load-it-ourselves path).
+    if (HMODULE ce = GetModuleHandleA("ClientExt.dll")) {
+        Log("[clientext] present at init (static import); neutralizing early");
+        NeutralizeClientExt(ce);
+    }
     LoadGlueScript();      // loose override, else embedded
     InstallGlueDetour();   // registers custom fns + runs the glue script in the glue state
     InstallExecuteDetour();// re-registers custom fns into the IN-GAME lua_State (ExtBank* callable in world)

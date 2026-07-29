@@ -192,10 +192,14 @@ local function InstallMotd()
     end
     banner:Hide()
 
+    local TEXT_WIDTH = 410   -- banner width minus 20px insets each side
+
     local text = banner:CreateFontString(nil, "ARTWORK", "GlueFontHighlight")
-    text:SetPoint("TOPLEFT",  banner, "TOPLEFT",  20, -20)
-    text:SetPoint("TOPRIGHT", banner, "TOPRIGHT", -20, -20)
+    text:SetPoint("TOP", banner, "TOP", 0, -20)
+    text:SetWidth(TEXT_WIDTH)
+    text:SetHeight(0)        -- auto: word-wraps within TEXT_WIDTH
     text:SetJustifyH("CENTER")
+    text:SetJustifyV("TOP")
 
     local close = CreateFrame("Button", nil, banner)
     close:SetWidth(32); close:SetHeight(32)
@@ -206,12 +210,43 @@ local function InstallMotd()
 
     local shownDate, lastClosedDate = nil, nil
 
+    -- In the glue state GetStringHeight() returns the height of ONE line even
+    -- when the string is word-wrapped (verified in-game), so the wrapped
+    -- height cannot be read back from the widget. Instead, replicate the
+    -- engine's greedy word-wrap with a hidden measuring FontString and
+    -- GetStringWidth() (which IS reliable) to count lines, then size the box.
+    local measure = banner:CreateFontString(nil, "ARTWORK", "GlueFontHighlight")
+    measure:Hide()
+
+    local function WrappedLineCount(msg)
+        local lines = 0
+        for para in string.gmatch(msg .. "\n", "([^\n]*)\n") do
+            local line = ""
+            for word in string.gmatch(para, "%S+") do
+                local try = (line == "") and word or (line .. " " .. word)
+                measure:SetText(try)
+                if measure:GetStringWidth() > TEXT_WIDTH and line ~= "" then
+                    lines = lines + 1    -- current line is full, wrap
+                    line = word
+                else
+                    line = try
+                end
+            end
+            lines = lines + 1            -- last (or empty) line of the paragraph
+        end
+        if lines < 1 then lines = 1 end
+        return lines
+    end
+
     local function ShowMessage(date, msg)
         shownDate = date
         text:SetText(msg)
-        banner:SetHeight(text:GetHeight() + 44)
+        measure:SetText("Ag")
+        local lineH = measure:GetStringHeight() or 15
+        local n = WrappedLineCount(msg)
+        banner:SetHeight(n * (lineH + 2) + 40)
         banner:Show()
-        log("motd: showing message (date="..tostring(date)..")")
+        log("motd: showing message (date="..tostring(date)..", lines="..n..", lineH="..lineH..")")
     end
 
     close:SetScript("OnClick", function()
